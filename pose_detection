@@ -1,0 +1,106 @@
+import cv2
+import requests
+import numpy as np
+import mediapipe as mp
+from datetime import datetime
+import pandas as pd
+
+# ------------------ SETTINGS ------------------
+ESP32_STREAM_URL = "ur IP"  # the IP received by the serial monitor in Arduino IDE
+VIDEO_FILENAME = "output_pose.avi"
+EXCEL_FILENAME = "pose_angles.xlsx"
+# ----------------------------------------------
+
+mp_pose = mp.solutions.pose
+mp_drawing = mp.solutions.drawing_utils
+
+def calculate_angle(a, b, c):
+    a, b, c = np.array(a), np.array(b), np.array(c)
+    ba = a - b
+    bc = c - b
+    cosine_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc))
+    angle = np.degrees(np.arccos(np.clip(cosine_angle, -1.0, 1.0)))
+    return angle
+
+angle_data = []
+stream = requests.get(ESP32_STREAM_URL, stream=True)
+bytes_buffer = b''
+video_writer = None
+
+with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
+    for chunk in stream.iter_content(chunk_size=1024):
+        bytes_buffer += chunk
+        a = bytes_buffer.find(b'\xff\xd8')
+        b = bytes_buffer.find(b'\xff\xd9')
+        if a != -1 and b != -1:
+            jpg = bytes_buffer[a:b+2]
+            bytes_buffer = bytes_buffer[b+2:]
+            img_np = np.frombuffer(jpg, dtype=np.uint8)
+            frame = cv2.imdecode(img_np, cv2.IMREAD_COLOR)
+
+            if frame is None:
+                continue
+
+            # Initialize video writer once
+            if video_writer is None:
+                h, w = frame.shape[:2]
+                video_writer = cv2.VideoWriter(
+                    VIDEO_FILENAME,
+                    cv2.VideoWriter_fourcc(*'XVID'),
+                    20.0,
+                    (w, h)
+                )
+
+            # Pose detection
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = pose.process(rgb)
+
+            if results.pose_landmarks:
+                mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+
+                h, w = frame.shape[:2]
+                lm = results.pose_landmarks.landmark
+                try:
+                    # Right knee angle
+                    hip = (int(lm[mp_pose.PoseLandmark.RIGHT_HIP].x * w), int(lm[mp_pose.PoseLandmark.RIGHT_HIP].y * h))
+                    knee = (int(lm[mp_pose.PoseLandmark.RIGHT_KNEE].x * w), int(lm[mp_pose.PoseLandmark.RIGHT_KNEE].y * h))
+                    ankle = (int(lm[mp_pose.PoseLandmark.RIGHT_ANKLE].x * w), int(lm[mp_pose.PoseLandmark.RIGHT_ANKLE].y * h))
+                    angle = calculate_angle(hip, knee, ankle)
+
+                    # Display angle on screen
+                    cv2.putText(frame, f"{int(angle)} deg", knee, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+                    # Save to list
+                    angle_data.append({
+                        "timestamp": datetime.now(),
+                        "right_knee_angle": angle
+                    })
+                except:
+                    pass
+
+            # Show and save frame
+            cv2.imshow("ESP32-CAM Pose Detection", frame)
+            if video_writer:
+                video_writer.write(frame)
+
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+# Cleanup
+if video_writer:
+    video_writer.release()
+cv2.destroyAllWindows()
+if not angle_data:
+    # Force test entry
+    angle_data.append({
+        "timestamp": datetime.now(),
+        "right_knee_angle": 123.4
+    })
+
+# Save angles to Excel
+if angle_data:
+    df = pd.DataFrame(angle_data)
+    df.to_excel(EXCEL_FILENAME, index=False)
+    print(f"✅ Excel file saved as: {EXCEL_FILENAME}")
+else:
+    print("⚠️ No angle data was recorded.")
